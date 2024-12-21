@@ -1,0 +1,371 @@
+---
+
+- name: Add repo key
+  apt_key:
+    url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    state: present
+  tags:
+    - postgresql
+
+- name: Add mirror repo
+  apt_repository:
+    repo: deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main
+    state: present
+  tags:
+    - postgresql
+
+- name: Update cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  tags:
+    - postgresql
+
+- name: Install software on Ubuntu
+  apt:
+    name: "{{ item.name }}"
+    state: present
+  loop:
+    - { name: traceroute }
+    - { name: python3-psycopg2 }
+    - { name: postgresql-14 }
+    - { name: postgresql-contrib }
+    - { name: sshpass }
+    - { name: barman-cli }
+  when: "'postgres' in group_names"
+  tags:
+    - postgresql
+
+- name: Install software on Ubuntu barman
+  apt:
+    name: "{{ item.name }}"
+    state: present
+  loop:
+    - { name: traceroute }
+    - { name: python3-psycopg2 }
+    - { name: sshpass }
+    - { name: barman-cli }
+    - { name: postgresql-14 }
+    - { name: barman }
+  when: ansible_hostname == "barman"
+  tags:
+    - postgresql
+
+- name: Start postgresql
+  service:
+    name: postgresql
+    state: started
+    enabled: yes
+  when: "'postgres' in group_names"
+  tags:
+    - postgresql
+
+- name: Create user for replication
+  community.postgresql.postgresql_user:
+    user: "{{ item.name }}"
+    password: "{{ item.passwd }}"
+    role_attr_flags: "{{ item.role }}"
+  become: true
+  become_user: postgres
+  when: "'postgres' in group_names"
+  loop:
+    - { name: replicator, passwd: "Otus2022!", role: "REPLICATION" }
+    - { name: barman, passwd: "Otus2024!", role: "REPLICATION,SUPERUSER" }
+  environment:
+    PGOPTIONS: "-c password_encryption=scram-sha-256"
+  tags:
+    - postgresql_conf
+
+- name: Add rules in postgres hba
+  community.postgresql.postgresql_pg_hba:
+    dest: /etc/postgresql/14/main/pg_hba.conf
+    contype: host
+    users: "{{ item.user }}"
+    source: "{{ item.src }}"
+    databases: "{{ item.db }}"
+    method: scram-sha-256
+  when: "'postgres' in group_names"
+  loop:
+    - { src: 192.168.57.11/32, user: replicator, db: replication }
+    - { src: 192.168.57.12/32, user: replicator, db: replication }
+    - { src: 192.168.57.13/32, user: barman, db: all }
+    - { src: 192.168.57.13/32, user: barman, db: replication }
+  tags:
+    - postgresql_conf
+
+- name: Add postgresql server conf
+  lineinfile:
+    path: "/etc/postgresql/14/main/postgresql.conf"
+    line: "{{ item }}"
+  loop:
+    - "listen_addresses = '*'"
+    - "port = 5432"
+    - "max_connections = 100"
+    - "log_directory = 'log'"
+    - "log_filename = 'postgresql-%a.log'"
+    - "log_rotation_age = 1d"
+    - "log_rotation_size = 0"
+    - "log_truncate_on_rotation = on"
+    - "max_wal_size = 1GB"
+    - "min_wal_size = 80MB"
+    - "log_line_prefix = '%m [%p] '"
+    - "log_timezone = 'UTC+3'"
+    - "timezone = 'UTC+3'"
+    - "datestyle = 'iso, mdy'"
+    - "lc_messages = 'en_US.UTF-8'"
+    - "lc_monetary = 'en_US.UTF-8'"
+    - "lc_numeric = 'en_US.UTF-8'"
+    - "lc_time = 'en_US.UTF-8'"
+    - "default_text_search_config = 'pg_catalog.english'"
+    - "hot_standby = on"
+    - "wal_level = replica"
+    - "max_wal_senders = 3"
+    - "max_replication_slots = 3"
+    - "hot_standby_feedback = on"
+    - "password_encryption = scram-sha-256"
+  when: "'postgres' in group_names"
+  tags:
+    - postgresql_conf
+
+- name: Restart postgresql
+  service:
+    name: postgresql
+    state: restarted
+  when: "'postgres' in group_names"
+  tags:
+    - postgresql_conf
+
+- name: Stop postgresql node2
+  service:
+    name: postgresql
+    state: stopped
+  when: ansible_hostname == "node2"
+  tags:
+    - postgresql_repl
+
+- name: Remove data directory
+  ansible.builtin.file:
+    path: /var/lib/postgresql/14/main/
+    state: absent
+  when: ansible_hostname == "node2"
+  tags:
+    - postgresql_repl
+
+- name: Create data directory
+  ansible.builtin.file:
+    path: /var/lib/postgresql/14/main
+    owner: postgres
+    group: postgres
+    mode: '0700'
+    state: directory
+  when: ansible_hostname == "node2"
+  tags:
+    - postgresql_repl
+
+- name: Create pgpass
+  ansible.builtin.file:
+    path: /var/lib/postgresql/.pgpass
+    owner: postgres
+    group: postgres
+    mode: '0600'
+    state: touch
+  when: ansible_hostname == "node2"
+  tags:
+    - postgresql_repl
+
+- name: Add pg pass
+  lineinfile:
+    path: "/var/lib/postgresql/.pgpass"
+    line: '{{ hostvars["node1"]["ansible_host"] }}:5432:replication:replicator:Otus2022!'
+  when: ansible_hostname == "node2"
+  tags:
+    - postgresql_repl
+
+- name: Run replication on node2
+  shell: pg_basebackup -h {{ hostvars["node1"]["ansible_host"] }} -U replicator  -D /var/lib/postgresql/14/main/ -R -P
+  become: true
+  become_user: postgres
+  when: ansible_hostname == "node2"
+  tags:
+    - postgresql_repl
+
+- name: Start postgresql node2
+  service:
+    name: postgresql
+    state: started
+  when: ansible_hostname == "node2"
+  tags:
+    - postgresql_repl
+
+- name: Gen ssh key barman
+  shell: ssh-keygen -t rsa -b 4096 -f /var/lib/barman/.ssh/id_rsa -N ""
+  become: true
+  become_user: barman
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Transform key
+  shell: cat /var/lib/barman/.ssh/id_rsa.pub > /home/vagrant/authorized_keys
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Set priv
+  ansible.builtin.file:
+    path: /home/vagrant/authorized_keys
+    owner: vagrant
+    group: vagrant
+    mode: '0644'
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Copy key
+  shell: sshpass -p 'vagrant' scp -o "StrictHostKeyChecking no"  vagrant@{{ hostvars["barman"]["ansible_host"] }}:/home/vagrant/authorized_keys /home/vagrant/authorized_keys
+  when: ansible_hostname == "node1"
+  tags:
+    - barman
+
+- name: Create dir .ssh
+  file:
+    path: /var/lib/postgresql/.ssh
+    owner: postgres
+    group: postgres
+    mode: '0744'
+    state: directory
+  when: ansible_hostname == "node1"
+  tags:
+    - barman
+
+- name: Copy key for barman
+  shell: cp /home/vagrant/authorized_keys /var/lib/postgresql/.ssh/authorized_keys && chmod 644 /var/lib/postgresql/.ssh/authorized_keys && chown postgres:postgres /var/lib/postgresql/.ssh/authorized_keys
+  when: ansible_hostname == "node1"
+  tags:
+    - barman
+
+- name: Create DB
+  community.postgresql.postgresql_db:
+    name: otus
+  when: ansible_hostname == "node1"
+  become: true
+  become_user: postgres
+  tags:
+    - barman
+
+- name: Create _table
+  community.postgresql.postgresql_table:
+    db: otus
+    name: test
+    columns:
+    - id int
+    - name varchar(30)
+  become: true
+  become_user: postgres
+  when: ansible_hostname == "node1"
+  tags:
+    - barman
+
+- name: Insert data in PG
+  shell: 'psql -d otus -c "INSERT INTO test VALUES (1, ''alex'');"'
+  become: true
+  become_user: postgres
+  when: ansible_hostname == "node1"
+  tags:
+    - barman
+
+- name: Create pgpass barman
+  ansible.builtin.file:
+    path: /var/lib/barman/.pgpass
+    owner: barman
+    group: barman
+    mode: '0600'
+    state: touch
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Add pg pass
+  lineinfile:
+    path: "/var/lib/barman/.pgpass"
+    line: '{{ hostvars["node1"]["ansible_host"] }}:5432:*:barman:Otus2024!'
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Copy file barman conf
+  template:
+    src: barman.conf
+    dest: /etc/barman.conf
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Copy file barman pg conf
+  template:
+    src: node1.conf
+    dest: /etc/barman.d/node1.conf
+    owner: root
+    group: root
+    mode: '0644'
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Copy file barman cron
+  template:
+    src: barman.cron
+    dest: /etc/cron.d/barman.cron
+    owner: root
+    group: root
+    mode: '0744'
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Restart cron
+  service:
+    name: cron
+    state: restarted
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: Copy barman shell cron
+  template:
+    src: barman.shell.cron
+    dest: /etc/barman.d/barman.shell.cron
+    owner: barman
+    group: barman
+    mode: '0744'
+  when: ansible_hostname == "barman"
+  tags:
+    - barman
+
+- name: barman pause
+  become: true
+  become_user: barman
+  shell: sleep 60
+  when: ansible_hostname == "barman"
+  tags:
+    - barman_run_repl
+
+- name: barman switch-wal node1
+  become: true
+  become_user: barman
+  shell: barman switch-wal node1
+  when: ansible_hostname == "barman"
+  tags:
+    - barman_run_repl
+
+- name: barman cron
+  become: true
+  become_user: barman
+  shell: barman cron
+  when: ansible_hostname == "barman"
+  tags:
+    - barman_run_repl
+
